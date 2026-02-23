@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NGX Financial Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>NGX Financial Intelligence Dashboard</h1>
+      <p>Real-feed ready dashboard for Nigerian listed companies (2019–2025)</p>
+    </div>
+    <button id="themeToggle" aria-label="Toggle dark mode">🌙</button>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Market Overview</h2>
+      <div id="marketCards" class="card-grid"></div>
+    </section>
+
+    <section class="panel controls">
+      <div class="control-block">
+        <label>Reporting Basis</label>
+        <div class="segmented" id="periodTabs"></div>
+      </div>
+      <div class="control-block">
+        <label for="yearSelect">Year</label>
+        <select id="yearSelect"></select>
+      </div>
+      <div class="control-block search-block">
+        <label for="companySearch">Search Company</label>
+        <input id="companySearch" type="search" placeholder="e.g. Dangote Cement" />
+        <div id="searchResults" class="search-results"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="companySection">
+      <h2 id="companyTitle">Company Focus</h2>
+      <div class="stats-grid" id="companyStats"></div>
+      <div class="chart-grid">
+        <article class="chart-card">
+          <h3>Revenue Trend</h3>
+          <canvas id="revenueChart" width="400" height="200"></canvas>
+        </article>
+        <article class="chart-card">
+          <h3>Profit & Cash Flow Trend</h3>
+          <canvas id="profitChart" width="400" height="200"></canvas>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Peer Comparables</h2>
+      <p id="peerContext"></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Company</th>
+              <th>Revenue (₦bn)</th>
+              <th>EBITDA Margin</th>
+              <th>P/E</th>
+              <th>P/B</th>
+              <th>Assets (₦bn)</th>
+              <th>Debt/Equity</th>
+              <th>Leverage</th>
+            </tr>
+          </thead>
+          <tbody id="peerTable"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Data pipeline: TradingView market feed + AfricanFinancials filing extraction scripts in <code>scripts/</code>.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
