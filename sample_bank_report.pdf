@@ -1,0 +1,97 @@
+# Annual Report -> seed_financials.csv extractor
+
+Populates `data/seed_financials.csv` from audited annual report PDFs
+(NGX filings). One CSV row = one ticker + one financial year.
+
+## Why this is two steps, not one "auto-fill" command
+
+Nigerian issuers format their financial statements very differently
+(banks vs. non-banks, different comparative-year layouts, figures stated
+in `N'000` vs `N'million` vs full Naira, etc). A script that silently
+writes numbers straight into the master CSV risks putting a wrong figure
+into a real financial dataset with no way to notice. So the pipeline is:
+
+1. `extract.py` reads a PDF and writes a **candidates JSON** file with
+   every value it found, the page/table it came from, and the raw text
+   it matched — nothing touches the CSV yet.
+2. You open the JSON, compare each value against the PDF for that ticker
+   and year, and fix anything wrong or missing.
+3. `merge_into_csv.py` writes the reviewed JSON into the CSV. It only
+   fills cells that are currently blank — it will never overwrite a
+   value that's already there — and formats every monetary figure as a
+   full Naira integer (no commas, no ₦, no abbreviations), leaving
+   not-applicable fields blank.
+
+## Setup
+
+```bash
+cd pdf_financial_extractor
+pip install -r requirements.txt
+```
+
+## 1. Extract candidates from a PDF
+
+```bash
+python extract.py \
+  --pdf "/path/to/GTCO_FY2025_Annual_Report.pdf" \
+  --ticker GTCO \
+  --period-end 2025-12-31 \
+  --source-doc "FY2025 Audited Results - NGX filing" \
+  --out candidates_GTCO_2025.json
+```
+
+This:
+- Extracts every table and text line from the PDF with `pdfplumber`.
+- Matches row/line labels against the line-item patterns in `config.py`
+  (revenue, gross earnings, profit before tax, total assets, deposits
+  from customers, etc — see `LABEL_PATTERNS`).
+- Detects the unit the statement is expressed in (`N'000`, `N million`,
+  "in thousands of Naira", ...) from nearby page text and multiplies
+  values up to full Naira amounts.
+- Handles `(123,456)`-style negatives (impairment charges, tax expense,
+  cost of sales are usually shown this way).
+- Skips columns that don't apply to the entity type (banks don't have
+  `cost_of_sales`/`gross_profit`/`operating_profit`/`ebitda`; non-banks
+  don't have `net_interest_income`/`impairment_charge`/
+  `customer_deposits`/`loans_advances` — see `ENTITY_TYPE` in
+  `config.py`, add new tickers there as needed).
+
+Open the resulting JSON and check `fields.<column>.value` against the
+PDF page listed in `candidates`. Edit the `value` directly for anything
+missing or wrong.
+
+## 2. Merge reviewed candidates into the CSV
+
+```bash
+python merge_into_csv.py \
+  --csv ../data/seed_financials.csv \
+  --candidates candidates_GTCO_2025.json
+```
+
+Only blank cells for the matching `(ticker, period_end)` row are filled;
+everything else in the CSV is left exactly as-is. Pass
+`--allow-overwrite` only if you deliberately want to replace an existing
+value.
+
+Repeat steps 1–2 once per (ticker, financial year) PDF — e.g. three runs
+for GTCO's FY2023, FY2024, FY2025 audited annual reports.
+
+## Testing the pipeline without a real PDF
+
+`tests/make_sample_pdf.py` generates a synthetic bank-report PDF (two
+comparative year columns, figures in `N'000`, parenthesized negatives)
+so you can sanity-check the extractor end to end:
+
+```bash
+python tests/make_sample_pdf.py
+python extract.py --pdf tests/sample_bank_report.pdf --ticker GTCO \
+  --period-end 2025-12-31 --source-doc "TEST" \
+  --out tests/candidates_GTCO_2025.json
+```
+
+## Adding a new ticker or label variant
+
+- New ticker: add it to `ENTITY_TYPE` in `config.py` (`"bank"` or
+  `"nonbank"`).
+- A label the extractor didn't recognize: add the regex variant to the
+  relevant list in `LABEL_PATTERNS` in `config.py`.

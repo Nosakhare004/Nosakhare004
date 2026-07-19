@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+Extract candidate financial figures from an audited annual report PDF.
+
+This does NOT write directly into seed_financials.csv. It reads a PDF,
+finds lines/table rows that look like the required line items, normalizes
+the values to full Naira amounts, and writes a "candidates" JSON file for
+a human to review (numbers copied out of financial statements should
+always be spot-checked against the source document before being trusted).
+
+Usage:
+    python extract.py \
+        --pdf "/path/to/GTCO_FY2025_Annual_Report.pdf" \
+        --ticker GTCO \
+        --period-end 2025-12-31 \
+        --source-doc "FY2025 Audited Results - NGX filing" \
+        --out candidates_GTCO_2025.json
+
+Then review/edit the JSON (fill in the "value" field for anything the
+script could not find or got wrong) and run merge_into_csv.py.
+"""
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+import pdfplumber
+
+from config import (
+    ENTITY_TYPE,
+    LABEL_PATTERNS,
+    NOT_APPLICABLE_BY_ENTITY_TYPE,
+    PER_SHARE_COLUMNS,
+    UNIT_SCALE_PATTERNS,
+)
+
+YEAR_HEADER_RE = re.compile(r"(20\d{2})")
+NUMBER_RE = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?\)?")
+FOOTNOTE_RE = re.compile(r"\s*\(?\bnote[s]?\.?\s*\d*\)?\s*$", re.IGNORECASE)
+TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def clean_label(cell):
+    if cell is None:
+        return ""
+    text = str(cell).replace("\n", " ").strip()
+    text = FOOTNOTE_RE.sub("", text)
+    # Strip trailing parenthetical annotations like "(kobo)", "(N'000)", "(Note 12)"
+    while True:
+        stripped = TRAILING_PAREN_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def parse_number(cell):
+    """Parse a table/text cell into a float, honoring '(123)' as negative.
+    Returns None if the cell has no parseable number (blank, '-', 'N/A')."""
+    if cell is None:
+        return None
+    text = str(cell).strip()
+    if text in ("", "-", "–", "—", "N/A", "n/a"):
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    match = NUMBER_RE.search(text)
+    if not match:
+        return None
+    digits = match.group(0).strip("()").replace(",", "")
+    if not digits or digits in ("-",):
+        return None
+    try:
+        value = float(digits)
+    except ValueError:
+        return None
+    if negative or text.strip().startswith("-"):
+        value = -abs(value)
+    return value
+
+
+def detect_unit_scale(text):
+    lowered = text.lower()
+    for pattern, scale in UNIT_SCALE_PATTERNS:
+        if re.search(pattern, lowered):
+            return scale
+    return 1  # assume figures are already stated in full Naira
+
+
+def match_column(label):
+    for column, patterns in LABEL_PATTERNS.items():
+        for pattern in patterns:
+            if re.match(pattern, label, re.IGNORECASE):
+                return column
+    return None
+
+
+def find_year_columns(header_row, target_year):
+    """Given a table header row, return indices whose text mentions the
+    target year (e.g. 'Dec 2025', '2025', '31-Dec-25')."""
+    matches = []
+    for i, cell in enumerate(header_row):
+        if not cell:
+            continue
+        text = str(cell)
+        years = YEAR_HEADER_RE.findall(text)
+        if str(target_year) in years or str(target_year)[-2:] in re.findall(r"\d{2}", text):
+            matches.append(i)
+    return matches
+
+
+def extract_from_tables(pdf, target_year, columns_wanted):
+    candidates = {}
+    for page_index, page in enumerate(pdf.pages):
+        page_text = page.extract_text() or ""
+        scale = detect_unit_scale(page_text)
+        tables = page.extract_tables()
+        for table_index, table in enumerate(tables):
+            if not table or len(table) < 2:
+                continue
+            year_cols = None
+            for row in table[:3]:
+                cols = find_year_columns(row, target_year)
+                if cols:
+                    year_cols = cols
+                    break
+            for row in table:
+                if not row:
+                    continue
+                label = clean_label(row[0])
+                if not label:
+                    continue
+                column = match_column(label)
+                if column is None or column not in columns_wanted:
+                    continue
+                value = None
+                if year_cols:
+                    for idx in year_cols:
+                        if idx < len(row):
+                            value = parse_number(row[idx])
+                            if value is not None:
+                                break
+                if value is None:
+                    # fall back to the first numeric cell after the label
+                    for cell in row[1:]:
+                        value = parse_number(cell)
+                        if value is not None:
+                            break
+                if value is None:
+                    continue
+                if column not in PER_SHARE_COLUMNS:
+                    value = value * scale
+                candidates.setdefault(column, []).append(
+                    {
+                        "value": value,
+                        "page": page_index + 1,
+                        "table": table_index,
+                        "raw_row": row,
+                        "source": "table",
+                    }
+                )
+    return candidates
+
+
+def extract_from_text(pdf, columns_wanted, existing):
+    """Secondary pass over plain text lines, for statements pdfplumber
+    fails to recognize as tables. Only fills columns not already found."""
+    candidates = {}
+    for page_index, page in enumerate(pdf.pages):
+        text = page.extract_text() or ""
+        scale = detect_unit_scale(text)
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            numbers = NUMBER_RE.findall(stripped)
+            if not numbers:
+                continue
+            label_part = NUMBER_RE.split(stripped)[0]
+            label = clean_label(label_part)
+            column = match_column(label)
+            if column is None or column not in columns_wanted or column in existing:
+                continue
+            value = parse_number(numbers[0])
+            if value is None:
+                continue
+            if column not in PER_SHARE_COLUMNS:
+                value = value * scale
+            candidates.setdefault(column, []).append(
+                {
+                    "value": value,
+                    "page": page_index + 1,
+                    "raw_line": stripped,
+                    "source": "text",
+                }
+            )
+    return candidates
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--pdf", required=True, help="Path to the annual report PDF")
+    parser.add_argument("--ticker", required=True, help="Ticker as used in seed_financials.csv, e.g. GTCO")
+    parser.add_argument("--period-end", required=True, help="Financial year end date, e.g. 2025-12-31")
+    parser.add_argument("--source-doc", required=True, help="Value for the source_doc column")
+    parser.add_argument("--out", required=True, help="Path to write the candidates JSON file")
+    args = parser.parse_args()
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.exists():
+        sys.exit(f"PDF not found: {pdf_path}")
+
+    entity_type = ENTITY_TYPE.get(args.ticker.upper())
+    if entity_type is None:
+        sys.exit(
+            f"Unknown ticker '{args.ticker}'. Add it to ENTITY_TYPE in config.py "
+            "(bank vs nonbank) before extracting."
+        )
+    not_applicable = NOT_APPLICABLE_BY_ENTITY_TYPE.get(entity_type, set())
+    columns_wanted = [c for c in LABEL_PATTERNS if c not in not_applicable]
+
+    target_year = int(args.period_end.split("-")[0])
+
+    with pdfplumber.open(pdf_path) as pdf:
+        table_candidates = extract_from_tables(pdf, target_year, columns_wanted)
+        text_candidates = extract_from_text(pdf, columns_wanted, table_candidates)
+
+    result = {
+        "ticker": args.ticker.upper(),
+        "period_end": args.period_end,
+        "period_type": "FY",
+        "audited": "true",
+        "source_doc": args.source_doc,
+        "extracted_by": "script+review-pending",
+        "entity_type": entity_type,
+        "fields": {},
+    }
+
+    for column in columns_wanted:
+        picks = table_candidates.get(column) or text_candidates.get(column) or []
+        if picks:
+            # First match wins; alternates are kept for the reviewer to compare.
+            result["fields"][column] = {
+                "value": picks[0]["value"],
+                "candidates": picks,
+                "needs_review": True,
+            }
+        else:
+            result["fields"][column] = {
+                "value": None,
+                "candidates": [],
+                "needs_review": True,
+            }
+
+    for column in not_applicable:
+        result["fields"][column] = {"value": None, "candidates": [], "not_applicable": True}
+
+    out_path = Path(args.out)
+    out_path.write_text(json.dumps(result, indent=2))
+    found = sum(1 for c in columns_wanted if result["fields"][c]["value"] is not None)
+    print(f"Wrote {out_path} ({found}/{len(columns_wanted)} fields found — review before merging).")
+
+
+if __name__ == "__main__":
+    main()
